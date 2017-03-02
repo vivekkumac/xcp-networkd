@@ -25,6 +25,7 @@ exception Read_error
 exception Write_error
 
 let config_file_path = "/var/lib/xcp/networkd.db"
+let temporary_bridge = "xentemp"
 
 let read_management_conf () =
 	try
@@ -33,9 +34,10 @@ let read_management_conf () =
 		let args = List.map (fun s -> match (String.split '=' s) with k :: [v] -> k, String.strip ((=) '\'') v | _ -> "", "") args in
 		debug "Firstboot file management.conf has: %s" (String.concat "; " (List.map (fun (k, v) -> k ^ "=" ^ v) args));
 		let device = List.assoc "LABEL" args in
-		Inventory.reread_inventory ();
-		let bridge_name = Inventory.lookup Inventory._management_interface in
-		debug "Management bridge in inventory file: %s" bridge_name;
+		let vlan = if List.mem_assoc "VLAN" args then List.assoc "VLAN" args else "" in
+		(* Bridge name for device ethX must be xenbrX *)
+		let bridge_name = "xenbr" ^ (String.sub device 3 (String.length device - 3)) in
+		debug "Management bridge determined is: %s" bridge_name;
 		let mac = Network_utils.Ip.get_mac device in
 		let ipv4_conf, ipv4_gateway, dns =
 			match List.assoc "MODE" args with
@@ -64,13 +66,26 @@ let read_management_conf () =
 		in
 		let phy_interface = {default_interface with persistent_i = true} in
 		let bridge_interface = {default_interface with ipv4_conf; ipv4_gateway; persistent_i = true} in
-		let bridge = {default_bridge with
-			bridge_mac = Some mac;
-			ports = [device, {default_port with interfaces = [device]}];
-			persistent_b = true
-		} in
-		{interface_config = [device, phy_interface; bridge_name, bridge_interface];
-			bridge_config = [bridge_name, bridge];
+		let interface_config, bridge_config =
+			let primary_bridge_conf = {default_bridge with
+                        	bridge_mac = Some mac;
+	                        ports = [device, {default_port with interfaces = [device]}];
+        	                persistent_b = true
+                	} in
+			if vlan <> "" then begin
+				let secondary_bridge_conf = {default_bridge with
+					vlan = Some (bridge_name, int_of_string vlan);
+					bridge_mac = (Some mac);
+					persistent_b = true
+				} in
+				[device, phy_interface; bridge_name, phy_interface; temporary_bridge, bridge_interface],
+				[bridge_name, primary_bridge_conf; temporary_bridge, secondary_bridge_conf]
+			end
+			else
+				[device, phy_interface; bridge_name, bridge_interface],
+				[bridge_name, primary_bridge_conf]
+		in
+		{interface_config = interface_config; bridge_config = bridge_config;
 			gateway_interface = Some bridge_name; dns_interface = Some bridge_name}
 	with e ->
 		error "Error while trying to read firstboot data: %s\n%s"
